@@ -110,6 +110,8 @@ public:
   void emitSimpleExecutionMode(MCRegister Reg,
                                SPIRV::ExecutionMode::ExecutionMode EM);
   void outputExecutionMode(const Module &M);
+  bool shouldEmitContractionOff(const Module &M) const;
+  void addImplicitFPFastMathDefaultRequirements(const Module &M);
   void outputAnnotations(const Module &M);
   void outputModuleSections();
   void outputFPFastMathDefaultInfo();
@@ -511,6 +513,15 @@ static unsigned encodeVecTypeHint(Type *Ty) {
   llvm_unreachable("invalid type");
 }
 
+// Whether MI is a floating-point type that the implicit FPFastMathDefault
+// replacing ContractionOff applies to.
+static bool isFPFastMathDefaultTarget(const MachineInstr &MI) {
+  if (MI.getOpcode() != SPIRV::OpTypeFloat)
+    return false;
+  int64_t Width = MI.getOperand(1).getImm();
+  return Width == 16 || Width == 32 || Width == 64;
+}
+
 static void addOpsFromMDNode(MDNode *MDN, MCInst &Inst,
                              SPIRV::ModuleAnalysisInfo *MAI) {
   for (const MDOperand &MDOp : MDN->operands()) {
@@ -671,14 +682,7 @@ void SPIRVAsmPrinter::outputExecutionMode(const Module &M) {
                            SPIRV::Capability::PoisonFreezeKHR)) {
       emitSimpleExecutionMode(FReg, SPIRV::ExecutionMode::ArithmeticPoisonKHR);
     }
-    // --spirv-fp-contract=off forces to emit ContractionOff for this kernel
-    // entry point, --spirv-fp-contract=fast suppresses it.
-    bool EmitContractionOff =
-        ST->isKernel() && !M.getNamedMetadata("spirv.ExecutionMode") &&
-        SPIRVFPContract != SPIRVFPContractMode::Fast &&
-        (SPIRVFPContract == SPIRVFPContractMode::Off ||
-         !M.getNamedMetadata("opencl.enable.FP_CONTRACT"));
-    if (EmitContractionOff) {
+    if (shouldEmitContractionOff(M)) {
       if (ST->canUseExtension(SPIRV::Extension::SPV_KHR_float_controls2)) {
         // When SPV_KHR_float_controls2 is enabled, ContractionOff is
         // deprecated. We need to use FPFastMathDefault with the appropriate
@@ -704,13 +708,8 @@ void SPIRVAsmPrinter::outputExecutionMode(const Module &M) {
 
           // Collect the SPIRV type if it's a float.
           if (OpCode == SPIRV::OpTypeFloat) {
-            // Skip if the target type is not fp16, fp32, fp64.
-            const unsigned OpTypeFloatSize = MI->getOperand(1).getImm();
-            if (OpTypeFloatSize != 16 && OpTypeFloatSize != 32 &&
-                OpTypeFloatSize != 64) {
-              continue;
-            }
-            SPIRVFloatTypes.push_back(MI);
+            if (isFPFastMathDefaultTarget(*MI))
+              SPIRVFloatTypes.push_back(MI);
             continue;
           }
 
@@ -754,6 +753,36 @@ void SPIRVAsmPrinter::outputExecutionMode(const Module &M) {
       }
     }
   }
+}
+
+// --spirv-fp-contract=off forces to emit ContractionOff for kernel entry
+// points, --spirv-fp-contract=fast suppresses it.
+bool SPIRVAsmPrinter::shouldEmitContractionOff(const Module &M) const {
+  return ST->isKernel() && !M.getNamedMetadata("spirv.ExecutionMode") &&
+         SPIRVFPContract != SPIRVFPContractMode::Fast &&
+         (SPIRVFPContract == SPIRVFPContractMode::Off ||
+          !M.getNamedMetadata("opencl.enable.FP_CONTRACT"));
+}
+
+// With SPV_KHR_float_controls2, outputExecutionMode replaces the implicit
+// ContractionOff by an FPFastMathDefault for every fp16, fp32 and fp64 type.
+// Module analysis only accounts for FPFastMathDefault coming from
+// "spirv.ExecutionMode" metadata, so declare what it requires here, before the
+// capabilities and extensions are emitted.
+void SPIRVAsmPrinter::addImplicitFPFastMathDefaultRequirements(
+    const Module &M) {
+  if (!ST->canUseExtension(SPIRV::Extension::SPV_KHR_float_controls2) ||
+      !shouldEmitContractionOff(M) ||
+      MAI->getMSInstrs(SPIRV::MB_EntryPoints).empty())
+    return;
+  if (none_of(MAI->getMSInstrs(SPIRV::MB_TypeConstVars),
+              [](const MachineInstr *MI) {
+                return isFPFastMathDefaultTarget(*MI);
+              }))
+    return;
+  MAI->Reqs.getAndAddRequirements(SPIRV::OperandCategory::ExecutionModeOperand,
+                                  SPIRV::ExecutionMode::FPFastMathDefault, *ST);
+  MAI->Reqs.addExtension(SPIRV::Extension::SPV_KHR_float_controls2);
 }
 
 void SPIRVAsmPrinter::outputAnnotations(const Module &M) {
@@ -907,6 +936,8 @@ void SPIRVAsmPrinter::outputModuleSections() {
     NSDebugHandler->prepareModuleOutput(*ST, *MAI);
   if (AuxDataHandler)
     AuxDataHandler->prepareModuleOutput(*ST, *MAI);
+
+  addImplicitFPFastMathDefaultRequirements(*M);
 
   // Output instructions according to the Logical Layout of a Module:
   // 1,2. All OpCapability instructions, then optional OpExtension
